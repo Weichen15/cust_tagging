@@ -1,178 +1,202 @@
-from datetime import date
+import copy
+import os
 from io import BytesIO
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
+from pptx.util import Pt
+from pptx.oxml.ns import qn
 
-# 色系設定
-COLOR_TITLE_BG = RGBColor(0x1F, 0x45, 0x7E)   # 深藍
-COLOR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
-COLOR_ACCENT = RGBColor(0x2E, 0x86, 0xC1)      # 中藍
-COLOR_LIGHT_BG = RGBColor(0xF0, 0xF4, 0xF8)    # 淺藍灰
-COLOR_TEXT = RGBColor(0x2C, 0x3E, 0x50)        # 深灰藍
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.pptx")
+FONT = "微軟正黑體"
 
-
-def _set_cell_bg(cell, color: RGBColor):
-    from pptx.oxml.ns import qn
-    from lxml import etree
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    solidFill = etree.SubElement(tcPr, qn("a:solidFill"))
-    srgbClr = etree.SubElement(solidFill, qn("a:srgbClr"))
-    srgbClr.set("val", f"{color[0]:02X}{color[1]:02X}{color[2]:02X}")
+# Template slide indices (0-based)
+_COVER = 0      # 封面
+_NARR_CT = 3    # 標籤敘事 content
+_CAT_DIV = 5    # 內容分隔頁範本 (Slide 6)
+_CAT_TBL = 6    # 內容表格頁範本 (Slide 7)
+_THANKS = 9     # Thank You
 
 
-def _add_slide(prs, layout_idx=6):
-    layout = prs.slide_layouts[layout_idx]
-    return prs.slides.add_slide(layout)
+# ── 文字替換 ─────────────────────────────────────────────────
+
+def _replace_in_para(para, old: str, new: str):
+    """跨多個 run 做字串替換，保留第一個 run 的格式。"""
+    full = "".join(r.text for r in para.runs)
+    if old not in full:
+        return
+    new_text = full.replace(old, new)
+    if para.runs:
+        para.runs[0].text = new_text
+        for r in para.runs[1:]:
+            r.text = ""
 
 
-def _add_textbox(slide, left, top, width, height, text, font_size=18,
-                 bold=False, color=COLOR_TEXT, align=PP_ALIGN.LEFT, bg_color=None):
-    txBox = slide.shapes.add_textbox(
-        Inches(left), Inches(top), Inches(width), Inches(height)
-    )
-    if bg_color:
-        fill = txBox.fill
-        fill.solid()
-        fill.fore_color.rgb = bg_color
-    tf = txBox.text_frame
-    tf.word_wrap = True
-    p = tf.paragraphs[0]
-    p.alignment = align
-    run = p.add_run()
-    run.text = text
-    run.font.size = Pt(font_size)
-    run.font.bold = bold
-    run.font.color.rgb = color
-    return txBox
+def _replace_in_shape(shape, old: str, new: str):
+    if not shape.has_text_frame:
+        return
+    for para in shape.text_frame.paragraphs:
+        _replace_in_para(para, old, new)
 
+
+# ── 表格填入 ─────────────────────────────────────────────────
+
+def _fill_cell(cell, text: str, size: int = 11, bold: bool = False):
+    """清除並填入儲存格文字，套用字型設定。"""
+    cell.text = str(text)
+    if not text:
+        return
+    tf = cell.text_frame
+    if tf.paragraphs and tf.paragraphs[0].runs:
+        run = tf.paragraphs[0].runs[0]
+        run.font.name = FONT
+        run.font.size = Pt(size)
+        run.font.bold = bold
+
+
+def _fill_table(slide, stores: list):
+    """將店家資料填入投影片上的表格。"""
+    for shape in slide.shapes:
+        if not shape.has_table:
+            continue
+        tbl = shape.table
+        n_data = len(tbl.rows) - 1  # 扣掉標題列
+        for i in range(n_data):
+            row_idx = i + 1
+            if i < len(stores):
+                s = stores[i]
+                _fill_cell(tbl.cell(row_idx, 0), s.get("name", ""), bold=True)
+                _fill_cell(tbl.cell(row_idx, 1), s.get("note", ""))
+                _fill_cell(tbl.cell(row_idx, 2), s.get("source", ""))
+            else:
+                for col in range(3):
+                    _fill_cell(tbl.cell(row_idx, col), "")
+        return  # 一頁只有一個表格
+
+
+# ── 投影片複製 / 刪除 ─────────────────────────────────────────
+
+_LAYOUT_RT = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout"
+)
+
+
+def _add_slide_from_xml(prs, saved_xml, src_part=None):
+    """用已保存的 XML element 新增一張投影片，並複製圖片/媒體 relationships。"""
+    new_slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    # 複製圖片 / 媒體 relationships（跳過 slideLayout）
+    # 必須依照 rId 數字順序，確保 auto-assigned rId 與 shapes 引用的一致
+    if src_part is not None:
+        sorted_rels = sorted(
+            src_part.rels.items(),
+            key=lambda x: int(x[0][3:]),  # 'rId2' → 2
+        )
+        for rId, rel in sorted_rels:
+            if rel.reltype == _LAYOUT_RT:
+                continue
+            try:
+                if rel.is_external:
+                    new_slide.part.rels.get_or_add_ext_rel(
+                        rel.reltype, rel.target_ref
+                    )
+                else:
+                    new_slide.part.rels.get_or_add(rel.reltype, rel.target_part)
+            except Exception:
+                pass
+
+    # 複製背景
+    src_cSld = saved_xml.find(qn("p:cSld"))
+    dst_cSld = new_slide._element.find(qn("p:cSld"))
+    if src_cSld is not None:
+        src_bg = src_cSld.find(qn("p:bg"))
+        if src_bg is not None:
+            dst_bg = dst_cSld.find(qn("p:bg"))
+            if dst_bg is not None:
+                dst_cSld.remove(dst_bg)
+            dst_cSld.insert(0, copy.deepcopy(src_bg))
+
+        # 複製所有圖形
+        src_sp = src_cSld.find(qn("p:spTree"))
+        dst_sp = new_slide.shapes._spTree
+        for child in list(dst_sp)[2:]:
+            dst_sp.remove(child)
+        if src_sp is not None:
+            for child in list(src_sp)[2:]:
+                dst_sp.append(copy.deepcopy(child))
+
+    return new_slide
+
+
+def _delete_slide(prs, idx: int):
+    """刪除指定索引的投影片。"""
+    sldIdLst = prs.slides._sldIdLst
+    sldId = sldIdLst[idx]
+    rId = sldId.get(qn("r:id"))
+    prs.part.drop_rel(rId)
+    sldIdLst.remove(sldId)
+
+
+# ── 主要函式 ─────────────────────────────────────────────────
 
 def build_pptx(data: dict) -> BytesIO:
-    prs = Presentation()
-    prs.slide_width = Inches(13.33)
-    prs.slide_height = Inches(7.5)
+    prs = Presentation(TEMPLATE_PATH)
 
     label = data.get("label", "")
     summary = data.get("summary", "")
     categories = data.get("categories", [])
-    today = date.today().strftime("%Y/%m/%d")
 
-    # === Slide 1: 封面 ===
-    slide1 = _add_slide(prs)
-    bg = slide1.background
-    bg.fill.solid()
-    bg.fill.fore_color.rgb = COLOR_TITLE_BG
+    # Slide 1 封面：替換標籤名稱
+    cover = prs.slides[_COVER]
+    for shape in cover.shapes:
+        _replace_in_shape(shape, '"擷取標籤名稱"', label)
 
-    _add_textbox(slide1, 0.8, 1.8, 11.7, 1.5,
-                 f"客戶樣貌標籤分析", font_size=36, bold=True,
-                 color=COLOR_WHITE, align=PP_ALIGN.CENTER)
-    _add_textbox(slide1, 0.8, 3.4, 11.7, 1.0,
-                 f"標籤：{label}", font_size=28, bold=True,
-                 color=RGBColor(0xAE, 0xD6, 0xF1), align=PP_ALIGN.CENTER)
-    _add_textbox(slide1, 0.8, 4.6, 11.7, 0.6,
-                 today, font_size=16,
-                 color=RGBColor(0xCC, 0xCC, 0xCC), align=PP_ALIGN.CENTER)
+    # Slide 4 敘事內容：替換說明文字
+    narr = prs.slides[_NARR_CT]
+    for shape in narr.shapes:
+        _replace_in_shape(
+            shape,
+            '"針對這個標籤的規畫做一個說明"',
+            summary[:60],
+        )
 
-    # === Slide 2: 標籤說明 + 分類總覽 ===
-    slide2 = _add_slide(prs)
-    bg2 = slide2.background
-    bg2.fill.solid()
-    bg2.fill.fore_color.rgb = COLOR_LIGHT_BG
+    # 在刪除前，先把範本 XML 與 part 都保存起來
+    cat_div_xml  = copy.deepcopy(prs.slides[_CAT_DIV]._element)
+    cat_div_part = prs.slides[_CAT_DIV].part
+    cat_tbl_xml  = copy.deepcopy(prs.slides[_CAT_TBL]._element)
+    cat_tbl_part = prs.slides[_CAT_TBL].part
+    thanks_xml   = copy.deepcopy(prs.slides[_THANKS]._element)
+    thanks_part  = prs.slides[_THANKS].part
 
-    _add_textbox(slide2, 0.5, 0.3, 12.3, 0.7,
-                 f"標籤說明：{label}", font_size=22, bold=True,
-                 color=COLOR_TITLE_BG)
-    _add_textbox(slide2, 0.5, 1.1, 12.3, 1.0,
-                 summary, font_size=16, color=COLOR_TEXT)
+    # 刪除 slides 5–10（從後往前，避免索引位移）
+    for idx in range(10, 4, -1):
+        _delete_slide(prs, idx)
 
-    _add_textbox(slide2, 0.5, 2.2, 12.3, 0.5,
-                 "涵蓋分類", font_size=18, bold=True, color=COLOR_ACCENT)
-
-    cat_y = 2.8
-    for i, cat in enumerate(categories):
-        store_count = len(cat.get("stores", []))
-        _add_textbox(slide2, 0.8, cat_y, 11.8, 0.45,
-                     f"▸  {cat['category_name']}（{store_count} 家）",
-                     font_size=15, color=COLOR_TEXT)
-        cat_y += 0.48
-        if cat_y > 6.8:
-            break
-
-    # === Slide 3+: 各分類店家明細 ===
+    # 每個分類新增「分隔頁 + 表格頁」
     for cat in categories:
-        slide = _add_slide(prs)
-        bg_s = slide.background
-        bg_s.fill.solid()
-        bg_s.fill.fore_color.rgb = COLOR_LIGHT_BG
-
         cat_name = cat.get("category_name", "")
-        reason = cat.get("reason", "")
-        stores = cat.get("stores", [])
+        reason   = cat.get("reason", "")[:80]
+        stores   = cat.get("stores", [])
 
-        _add_textbox(slide, 0.5, 0.25, 12.3, 0.65,
-                     cat_name, font_size=22, bold=True, color=COLOR_TITLE_BG)
-        _add_textbox(slide, 0.5, 0.95, 12.3, 0.6,
-                     f"挑選原因：{reason}", font_size=13,
-                     color=RGBColor(0x55, 0x66, 0x77))
+        # 分隔頁
+        div_slide = _add_slide_from_xml(prs, cat_div_xml, cat_div_part)
+        for shape in div_slide.shapes:
+            _replace_in_shape(shape, '"內容1"', cat_name)
+            _replace_in_shape(shape, "內容1",   cat_name)
 
-        if not stores:
-            continue
+        # 表格頁
+        tbl_slide = _add_slide_from_xml(prs, cat_tbl_xml, cat_tbl_part)
+        for shape in tbl_slide.shapes:
+            _replace_in_shape(shape, '新增標籤 – "內容1"', f"新增標籤 – {cat_name}")
+            _replace_in_shape(shape, '"內容1"', cat_name)
+            _replace_in_shape(shape, "內容1",   cat_name)
+            _replace_in_shape(
+                shape,
+                '"可以針對這個內容，做一個概述，例如找尋的原因、總結…等，讓閱聽者能一目了然"',
+                reason,
+            )
+        _fill_table(tbl_slide, stores)
 
-        # 表格
-        rows = min(len(stores), 12) + 1
-        table = slide.shapes.add_table(
-            rows, 3,
-            Inches(0.5), Inches(1.7),
-            Inches(12.3), Inches(min(rows * 0.42, 5.5))
-        ).table
-
-        headers = ["店家 / 品牌", "說明", "資料來源"]
-        col_widths = [Inches(3.5), Inches(5.0), Inches(3.8)]
-        for i, w in enumerate(col_widths):
-            table.columns[i].width = w
-
-        for j, h in enumerate(headers):
-            cell = table.cell(0, j)
-            cell.text = h
-            _set_cell_bg(cell, COLOR_TITLE_BG)
-            p = cell.text_frame.paragraphs[0]
-            p.alignment = PP_ALIGN.CENTER
-            run = p.runs[0] if p.runs else p.add_run()
-            run.font.bold = True
-            run.font.color.rgb = COLOR_WHITE
-            run.font.size = Pt(13)
-
-        for r, store in enumerate(stores[:12], start=1):
-            row_data = [
-                store.get("name", ""),
-                store.get("note", ""),
-                store.get("source", ""),
-            ]
-            bg = COLOR_LIGHT_BG if r % 2 == 0 else COLOR_WHITE
-            for c, val in enumerate(row_data):
-                cell = table.cell(r, c)
-                cell.text = str(val)
-                _set_cell_bg(cell, bg)
-                p = cell.text_frame.paragraphs[0]
-                run = p.runs[0] if p.runs else p.add_run()
-                run.font.size = Pt(11)
-                run.font.color.rgb = COLOR_TEXT
-
-    # === 最後一頁：備註 ===
-    slide_last = _add_slide(prs)
-    bg_l = slide_last.background
-    bg_l.fill.solid()
-    bg_l.fill.fore_color.rgb = COLOR_TITLE_BG
-
-    _add_textbox(slide_last, 0.8, 2.5, 11.7, 1.0,
-                 "備註", font_size=28, bold=True,
-                 color=COLOR_WHITE, align=PP_ALIGN.CENTER)
-    _add_textbox(slide_last, 0.8, 3.6, 11.7, 1.5,
-                 "• 本份分析由 AI 自動產生，店家清單僅供參考，請依實際資料庫比對後調整\n"
-                 "• SAS 特店中文名稱需依實際資料庫欄位格式微調",
-                 font_size=15, color=RGBColor(0xAE, 0xD6, 0xF1))
+    # Thank You 頁
+    _add_slide_from_xml(prs, thanks_xml, thanks_part)
 
     buf = BytesIO()
     prs.save(buf)
