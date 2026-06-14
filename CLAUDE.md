@@ -56,9 +56,24 @@ GEMINI_API_KEY=你的金鑰
 ```
 
 ## SAS Code 說明
-- `sas_template.py` 目前使用 `index(MERCH_NAME_CHT, "店家名") > 0` 做字串比對
-- 變數命名：`TAG_{標籤}` 為總標籤，`TAG_{標籤}_{分類}` 為細分類
-- **待補**：使用者提供實際慣用的 SAS 寫法後，需更新 `sas_template.py` 的 template
+
+`sas_template.py` 對照 `sas_examples/客戶標籤_SAS_EXAMPLE.SAS` 慣例產出完整 9-Step 流程：
+
+| Step | 說明 |
+|------|------|
+| 1 | `DATA _NULL_` 建立日期 Macro（P1Y / L1M / P1M ... / DT / P1D） |
+| 2 | `PROC SQL` 撈取交易資料，中文店家 → `MERCHANT_CHI_NAME`，英文 → `MERCHANT_ENG_NAME` |
+| 3 | `DATA _PRE1` 認列判斷（`IDENTIFIED = '已認列'/'未認列'`），UPCASE + KPROPCASE 處理 |
+| 4 | `PROC SQL` 計算 `AMT_MACH` / `TXN_MACH`（CASE WHEN） |
+| 5 | `PROC SUMMARY` 依 CST_ID × YYYYMM 彙總 |
+| 6 | `PROC SUMMARY` 依 CST_ID 彙總，取得 `DIFF_MONTH_MACH` |
+| 7 | 統計確認：TABULATE / TICKET_SIZE / MAX_MIN / TOP10 / 極端值 / 消費月數分布 |
+| 8 | `PROC UNIVARIATE` 百分位（AMT / TXN / MONTH，25/50/75/90/95/99） |
+| 9 | 貼標輸出 `DATA.INT_{標籤}`，強度 1-3（依百分位人工調整閾值） |
+
+- 中文名稱自動偵測（含 Unicode CJK）→ 搭配 `MERCHANT_CHI_NAME` / `UMCHT_CNAME`
+- 英文名稱自動轉大寫 → 搭配 `MERCHANT_ENG_NAME` / `UMCHT_ENAME`
+- 表名前綴 `INT_{標籤}` 搭配 `OPTIONS VALIDVARNAME = ANY`
 
 ## PPTX 設計指南
 
@@ -69,7 +84,7 @@ GEMINI_API_KEY=你的金鑰
 - 動態新增投影片後必須跑 relationship QA 確認無 MISSING rId
 
 ## 待辦 / 後續優化
-- [ ] 使用者提供 SAS 慣用寫法 → 更新 `sas_template.py`
+- [x] `sas_template.py` 對照 `客戶標籤_SAS_EXAMPLE.SAS` 完整重寫
 - [ ] 加入多步驟確認流程（Phase 1 AI 腦力激盪 → 使用者確認 → Phase 2 網路搜尋）
 - [ ] 可考慮部署至 Streamlit Community Cloud 供組員共用
 - [ ] 若需保留歷史分析紀錄，可加入 SQLite 儲存
